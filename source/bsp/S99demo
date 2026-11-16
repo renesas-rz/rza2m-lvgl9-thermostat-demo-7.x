@@ -1,0 +1,16 @@
+#!/bin/sh
+# Auto-start the D/AVE 2D + LVGL demo
+APP=/root/bin/thermostat_a2m
+DEMO_APP=thermostat
+case "$1" in
+  start) echo "Starting $DEMO_APP demo"
+         # RGB-to-HDMI board (TFP410 at I2C 0x3c): power on, 24-bit, H/V sync on.
+         # No effect when the LCD panel is connected.
+         i2cset -y 0 0x3c 0x08 0x37 2>/dev/null
+         echo 0 > /sys/class/vtconsole/vtcon1/bind
+         cat /dev/zero > /dev/fb0 2>/dev/null
+         A2M_APP=$DEMO_APP A2M_MAX_FPS=30 $APP > /dev/console 2>&1 & ;;
+  stop)  killall thermostat_a2m 2>/dev/null ;;
+  restart) $0 stop; sleep 1; $0 start ;;
+esac
+exit 0

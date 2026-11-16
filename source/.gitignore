@@ -1,0 +1,4 @@
+build/
+*.o
+thermostat_a2m
+*.bin
