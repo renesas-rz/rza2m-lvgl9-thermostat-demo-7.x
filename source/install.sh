@@ -15,6 +15,7 @@ OVL=$BSP/board/$BOARD/overlay
 
 if [ "$3" = "remove" ]; then
   rm -f "$OVL/root/bin/thermostat_a2m" "$OVL/etc/init.d/S99demo"
+  rm -rf "$OVL/root/video"
   echo "Demo removed from $OVL. In the BSP: ./build.sh buildroot && ./build.sh images"
   exit 0
 fi
@@ -28,5 +29,7 @@ make CROSS_COMPILE="$CROSS_COMPILE" -j"$(nproc)"
 mkdir -p "$OVL/root/bin" "$OVL/etc/init.d"
 "${CROSS_COMPILE}strip" -o "$OVL/root/bin/thermostat_a2m" thermostat_a2m
 install -m 755 bsp/S99demo "$OVL/etc/init.d/S99demo"
+mkdir -p "$OVL/root/video"
+install -m 644 video/doorbell.h264 "$OVL/root/video/doorbell.h264"
 ls -lh "$OVL/root/bin/thermostat_a2m" "$OVL/etc/init.d/S99demo"
 echo "Installed. In the BSP: ./build.sh buildroot && ./build.sh images"

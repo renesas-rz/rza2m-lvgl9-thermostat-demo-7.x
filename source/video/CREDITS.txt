@@ -1,0 +1,8 @@
+video/doorbell.h264
+
+Big Buck Bunny, (c) copyright 2008, Blender Foundation / www.bigbuckbunny.org
+Licensed under the Creative Commons Attribution 3.0 license
+(https://creativecommons.org/licenses/by/3.0/), see https://peach.blender.org/about
+
+Changes: 28 s excerpt (from 0:02), scaled to 480x272, 25 fps, re-encoded as
+H.264 Constrained Baseline (raw Annex-B), attribution line added in the picture.

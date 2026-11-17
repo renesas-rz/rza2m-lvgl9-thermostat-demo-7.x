@@ -48,6 +48,7 @@
 #include "thermostat_ui_elite.h"
 #include "thermostat_service.h"
 #include "thermostat_hal.h"
+#include "thermostat_video.h"
 
 /* ============================================================== fonts */
 #include "fonts/tstat_fonts.h"
@@ -786,6 +787,7 @@ static void refresh_fan(const tstat_model_t * m)
 static void menu_cb(lv_event_t * e)
 {
     page_t pg = (page_t)(uintptr_t)lv_event_get_user_data(e);
+    if (PG_COUNT == pg) { thermostat_video_open(); return; }   /* Video row: overlay, not a page */
     if (PG_IDLEPICK == pg) {
         s_ui.ip_style  = s_cfg.idle_style;
         s_ui.ip_accent = s_cfg.accent;
@@ -800,15 +802,16 @@ static void menu_cb(lv_event_t * e)
 
 static void build_menu(lv_obj_t * pg)
 {
-    static const char * const names[] = { "Priority", "Ventilation", "Idle Screen", "Display & Units", "Equipment Status" };
+    static const char * const names[] = { "Priority", "Ventilation", "Idle Screen", "Display & Units", "Equipment Status", "Video" };
     static const char * const subs[]  = { "Choose rooms to average for comfort", "Fresh-air ventilation mode and timer",
                                           "Style and color of the idle display", "Theme, units, timeout, demo speed",
-                                          "Outputs, protection timers, system info" };
-    static const page_t dst[] = { PG_PRIORITY, PG_VENT, PG_IDLEPICK, PG_DISPLAY, PG_STATUS };
+                                          "Outputs, protection timers, system info",
+                                          "Play the front-door camera clip (H.264)" };
+    static const page_t dst[] = { PG_PRIORITY, PG_VENT, PG_IDLEPICK, PG_DISPLAY, PG_STATUS, PG_COUNT };
 
     lv_obj_t * t = label(pg, F_32, s_ui.T.fg, "Menu");
     lv_obj_set_pos(t, NAV_W + 12, 20);
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         lv_obj_t * r = box(pg, NAV_W + 12, 66 + i * 80, SCR_W - NAV_W - 32, 76);
         lv_obj_add_flag(r, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_set_style_radius(r, 10, 0);
@@ -826,6 +829,9 @@ static void build_menu(lv_obj_t * pg)
         lv_obj_align(c, LV_ALIGN_RIGHT_MID, -14, 0);
         lv_obj_add_event_cb(r, menu_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)dst[i]);
     }
+    lv_obj_add_flag(pg, LV_OBJ_FLAG_SCROLLABLE);              /* 6th row sits below the screen */
+    lv_obj_set_scroll_dir(pg, LV_DIR_VER);
+    lv_obj_set_style_pad_bottom(pg, 16, 0);
 }
 
 /* ============================================================ priority */

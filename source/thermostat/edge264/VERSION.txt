@@ -1,0 +1,1 @@
+edge264 from https://github.com/tvlabs/edge264 commit 4921fa3 (2026-11-16), BSD-3-Clause. Only the decoder sources; test tools left out.

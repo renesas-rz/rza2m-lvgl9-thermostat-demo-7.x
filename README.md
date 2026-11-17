@@ -68,6 +68,25 @@ and power on.
 Then set SW6 to run mode and power on. After a rootfs-only change, flash
 just that image: `./prebuilt/flash.sh rootfs`.
 
+## Doorbell video
+
+Menu -> Video plays an H.264 clip at 25 fps over the thermostat; tap to close.
+The decoder is edge264 (BSD-3, `source/thermostat/edge264/`), built into the
+app; frames are converted with NEON and written straight to the frame buffer.
+
+| Item | Value |
+|---|---|
+| Clip | `/root/video/doorbell.h264`, raw H.264 Baseline, 480x272, 25 fps |
+| Decode / convert per frame | about 25 ms / 6 ms (CPU about 80 % while playing) |
+| Test clip | Big Buck Bunny, (c) copyright 2008, Blender Foundation / www.bigbuckbunny.org, CC BY 3.0 (`source/video/CREDITS.txt`) |
+
+Use your own clip:
+
+```sh
+ffmpeg -i in.mp4 -vf scale=480:272 -r 25 -c:v libx264 -profile:v baseline -refs 1 -bf 0 \
+       -b:v 700k -an -bsf:v h264_mp4toannexb -f h264 source/video/doorbell.h264
+```
+
 ## Run
 
 The demo starts at boot (`/etc/init.d/S99demo`). Options, set as environment
@@ -75,6 +94,7 @@ variables before starting `/root/bin/thermostat_a2m`:
 
 | Variable | Values | Purpose |
 |---|---|---|
+| `THERMO_VIDEO` | path to a `.h264` file | Clip for Menu -> Video |
 | `THERMO_UI` | `elite` (default), `classic` | Choose the UI style |
 | `OVEN_GPU` | `1` (default), `0` | Turn the D/AVE 2D GPU on or off |
 | `A2M_MAX_FPS` | number, e.g. `30` | Limit the frame rate |

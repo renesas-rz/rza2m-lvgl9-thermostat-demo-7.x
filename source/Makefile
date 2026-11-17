@@ -26,6 +26,9 @@ DAVE_CFLAGS := -O2 $(ARCH_FLAGS) $(DAVE_INC) -w
 SRCS := main.c $(wildcard thermostat/*.c) $(wildcard thermostat/fonts/*.c) a2m_disp.c a2m_texcache.c \
         $(shell find fonts -type f -name '*.c' -not -path '*/preview-*') \
         $(shell find lvgl/src -type f -name '*.c')
+SRCS += thermostat/edge264/src/edge264.c
+build/thermostat/edge264/src/edge264.o: CFLAGS += -std=gnu11 -flax-vector-conversions -Wno-override-init -w -O3
+
 OBJS := $(patsubst %.c,build/%.o,$(SRCS)) $(patsubst %.c,build/%.o,$(DAVE_SRCS))
 APP  := thermostat_a2m
 
