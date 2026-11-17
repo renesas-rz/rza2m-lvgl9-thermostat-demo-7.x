@@ -49,15 +49,24 @@ Touch can be plugged in before or after power-on.
 
 ## Flash
 
-Program U-Boot, the kernel, the DTB and the rootfs as described in the BSP
-README. The prebuilt images go to:
+`prebuilt/` holds all four images, so the board can be flashed without
+building the BSP. Connect a SEGGER J-Link to CN5, set SW6 to program mode
+and power on.
 
-| Image | QSPI flash address |
+| Host | Command |
 |---|---|
-| `prebuilt/u-boot.bin` | 0x20000000 |
-| `prebuilt/rootfs.cramfs.bin` | 0x20800000 |
+| Linux | `./prebuilt/flash.sh all` (or `uboot`, `dtb`, `kernel`, `rootfs`) |
+| Windows | Double-click `prebuilt\Program_QSPI.bat`, then type `all` |
 
-The kernel (0x20200000) and DTB (0x200C0000) come from the BSP build.
+| Image | QSPI flash address | Contents |
+|---|---|---|
+| `u-boot.bin` | 0x20000000 | U-Boot 2026.10; sets the flash QE bit on first boot |
+| `r7s9210-rza2mevb.dtb.bin` | 0x200C0000 | Device tree: LCD, D/AVE 2D, USB host on CN12 |
+| `xipImage.bin` | 0x20200000 | Linux 7.3 XIP kernel with USB touch support |
+| `rootfs.cramfs.bin` | 0x20800000 | Root file system with the thermostat app |
+
+Then set SW6 to run mode and power on. After a rootfs-only change, flash
+just that image: `./prebuilt/flash.sh rootfs`.
 
 ## Run
 
