@@ -9,7 +9,7 @@
  *   THERMO_VIDEO=<file>     raw H.264 clip to play (default /root/video/doorbell.h264)
  *   THERMO_VIDEO_FPS=<n>    playback rate, 1-60 (default 25)
  *   THERMO_VIDEO_FULLRANGE=1  colours are full range (0-255)
- *   THERMO_VIDEO_FIT=1      scale the clip up to fill the screen (LVGL output, slower)
+ *   THERMO_VIDEO_FIT=0      1:1 at the centre instead of full screen (default: full screen, D/AVE)
  *   THERMO_VIDEO_LVGL=1     draw through an LVGL image instead of the frame buffer
  */
 #ifndef THERMOSTAT_VIDEO_H

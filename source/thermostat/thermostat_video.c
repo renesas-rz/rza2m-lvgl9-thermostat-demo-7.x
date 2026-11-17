@@ -6,11 +6,13 @@
  *   worker threads. Input is a raw H.264 stream (Annex-B .h264), mapped
  *   read-only from the rootfs and fed one NAL unit at a time. Looped.
  * - Each due frame (YCbCr 4:2:0) is converted to RGB565 (NEON on Cortex-A9).
- * - Output, default: converted straight into the frame-buffer page on screen, at
- *   the centre, so LVGL does not redraw the picture each frame. The
- *   thermostat screen under the black overlay is hidden meanwhile, so LVGL has
- *   nothing to redraw there. THERMO_VIDEO_LVGL=1 or THERMO_VIDEO_FIT=1 use an
- *   lv_image instead (slower; needed for scaling).
+ * - Output, default (full screen): converted into a buffer in D/AVE video memory,
+ *   then one D/AVE 2D scaled, filtered blit into the frame-buffer page on screen,
+ *   keeping the aspect ratio (480x272 -> 800x453 on the 800x480 panel).
+ *   THERMO_VIDEO_FIT=0: 1:1, converted straight into the page on screen.
+ *   Either way LVGL does not redraw the picture; the thermostat screen under the
+ *   black overlay is hidden meanwhile so LVGL has nothing to repaint there.
+ *   THERMO_VIDEO_LVGL=1: through an lv_image instead (slow; for comparison).
  * - Paced by an LVGL timer at a fixed frame rate (raw H.264 has no timestamps).
  *   When the CPU falls behind, late frames are still decoded (they are
  *   references) but only the newest due frame is converted and shown.
@@ -34,8 +36,13 @@
 #include <malloc.h>
 #include <sys/ioctl.h>
 #include "lvgl.h"
-#include "lvgl_private.h"           /* lv_image_cache_drop() */
+#include "lvgl_private.h"           /* lv_image_cache_drop(), draw units */
 #include "thermostat_video.h"
+#if LV_USE_DRAW_DAVE2D
+#include "dave_driver.h"
+#include "dave_base.h"
+#include "lvgl/src/draw/renesas/dave2d/lv_draw_dave2d.h"
+#endif
 #endif
 
 #define TV_DEFAULT_FILE  "/root/video/doorbell.h264"
@@ -218,7 +225,11 @@ static int            s_fb_fd = -1; /* kept open to read which page is on screen
 static size_t         s_fb_len;
 static uint32_t       s_fb_stride, s_fb_pages, s_fb_page_bytes;
 static size_t         s_fb_ofs;     /* byte offset of the picture's top-left in a page */
+static uintptr_t      s_fb_phys;    /* physical address of page 0 (for D/AVE) */
+static int            s_xres, s_yres;
 static lv_obj_t *     s_hidden_scr;
+static int            s_scaled;     /* D/AVE scales to full screen */
+static int            s_filter = 1; /* bilinear filter in the D/AVE scale (THERMO_VIDEO_FILTER=0: off) */
 
 static uint64_t tv_us(void)
 {
@@ -258,6 +269,9 @@ static int tv_fb_open(int w, int h)
     s_fb_fd = fd;
 
     s_fb = m;
+    s_fb_phys = (uintptr_t)fx.smem_start;
+    s_xres = (int)v.xres;
+    s_yres = (int)v.yres;
     s_fb_len = fx.smem_len;
     s_fb_stride = fx.line_length;
     s_fb_page_bytes = fx.line_length * v.yres;
@@ -268,15 +282,113 @@ static int tv_fb_open(int w, int h)
     return 0;
 }
 
-/* Picture's top-left pixel in the frame-buffer page now on screen (LVGL pans between pages). */
-static uint16_t * tv_fb_dst(void)
+/* Frame-buffer page now on screen (LVGL pans between pages). */
+static uint32_t tv_fb_page(void)
 {
     struct fb_var_screeninfo v;
     uint32_t page = 0u;
     if ((ioctl(s_fb_fd, FBIOGET_VSCREENINFO, &v) == 0) && (v.yres > 0u)) { page = v.yoffset / v.yres; }
-    if (page >= s_fb_pages) { page = 0u; }
-    return (uint16_t *)(void *)(s_fb + (size_t)page * s_fb_page_bytes + s_fb_ofs);
+    return (page < s_fb_pages) ? page : 0u;
 }
+
+/* Picture's top-left pixel (1:1 placement) in the page on screen. */
+static uint16_t * tv_fb_dst(void)
+{
+    return (uint16_t *)(void *)(s_fb + (size_t)tv_fb_page() * s_fb_page_bytes + s_fb_ofs);
+}
+
+/* ------------------------------------------------- D/AVE 2D scaling */
+#if LV_USE_DRAW_DAVE2D
+static d2_device *       s_d2;      /* LVGL's D/AVE device, borrowed */
+static d2_renderbuffer * s_d2_rb;   /* ours */
+static d2_renderbuffer * s_d2_lvrb; /* LVGL's, selected again after each blit */
+static void *            s_vm_phys; /* source picture in D/AVE video memory */
+static uint16_t *        s_vm;
+static int               s_dx, s_dy, s_dw, s_dh;
+static int               s_d2_busy; /* a blit was started and not yet waited for */
+static uint64_t          s_us_kick, s_us_wait;
+
+/* Wait until the last blit has finished reading the source buffer. */
+static void tv_d2_wait(void)
+{
+    if (s_d2_busy) {
+        d2_flushframe(s_d2);
+        s_d2_busy = 0;
+    }
+}
+
+static void tv_d2_close(void)
+{
+    if (NULL == s_d2) { return; }
+    tv_d2_wait();
+    if (NULL != s_d2_rb)   { d2_freerenderbuffer(s_d2, s_d2_rb); s_d2_rb = NULL; }
+    if (NULL != s_vm_phys) { d1_freevidmem(d2_level1interface(s_d2), d1_mem_texture, s_vm_phys); s_vm_phys = NULL; }
+    s_vm = NULL;
+    s_d2 = NULL;
+}
+
+/* Find LVGL's D/AVE unit, get a w x h RGB565 buffer in video memory, and fit
+ * the picture to the screen keeping its aspect ratio. 0 = ok. */
+static int tv_d2_open(int w, int h)
+{
+    lv_draw_unit_t * u = LV_GLOBAL_DEFAULT()->draw_info.unit_head;
+    d1_device * d1;
+
+    while ((NULL != u) && !((NULL != u->name) && (0 == strcmp(u->name, "DAVE2D")))) { u = u->next; }
+    if ((NULL == u) || (0u == s_fb_phys)) { return -1; }
+    s_d2 = ((lv_draw_dave2d_unit_t *)u)->d2_handle;
+    s_d2_lvrb = ((lv_draw_dave2d_unit_t *)u)->renderbuffer;
+    if ((NULL == s_d2) || (NULL == s_d2_lvrb)) { s_d2 = NULL; return -1; }
+
+    d1 = d2_level1interface(s_d2);
+    s_vm_phys = d1_allocvidmem(d1, d1_mem_texture, (unsigned int)(w * h * 2));
+    s_vm = (NULL != s_vm_phys) ? d1_mapfromvidmem(d1, s_vm_phys) : NULL;
+    s_d2_rb = d2_newrenderbuffer(s_d2, 8u, 8u);
+    if ((NULL == s_vm) || (NULL == s_d2_rb)) {
+        printf("video: no D/AVE video memory for %dx%d\n", w, h);
+        tv_d2_close();
+        return -1;
+    }
+    memset(s_vm, 0, (size_t)w * (size_t)h * 2u);
+
+    s_dw = s_xres;
+    s_dh = (h * s_xres + w / 2) / w;
+    if (s_dh > s_yres) { s_dh = s_yres; s_dw = (w * s_yres + h / 2) / h; }
+    s_dx = (s_xres - s_dw) / 2;
+    s_dy = (s_yres - s_dh) / 2;
+    return 0;
+}
+
+/* Start a scaled, filtered copy of the video-memory picture into frame-buffer
+ * page 'page'. D/AVE runs it while the CPU decodes the next frame; tv_d2_wait()
+ * is called before the source buffer is written again. */
+static void tv_d2_blit(uint32_t page)
+{
+    const d2_u32 bsrc = d2_getblendmodesrc(s_d2), bdst = d2_getblendmodedst(s_d2);
+    const d2_alpha alpha = d2_getalpha(s_d2);
+
+    d2_selectrenderbuffer(s_d2, s_d2_rb);
+    d2_setblendmode(s_d2, d2_bm_one, d2_bm_zero);
+    d2_setalpha(s_d2, 0xFF);
+    d2_framebuffer(s_d2, (void *)(s_fb_phys + (uintptr_t)page * s_fb_page_bytes),
+                   (d2_s32)(s_fb_stride / 2u), (d2_u32)s_xres, (d2_u32)s_yres, d2_mode_rgb565);
+    d2_cliprect(s_d2, (d2_border)s_dx, (d2_border)s_dy, (d2_border)(s_dx + s_dw - 1), (d2_border)(s_dy + s_dh - 1));
+    d2_setblitsrc(s_d2, s_vm_phys, s_w, s_w, s_h, d2_mode_rgb565);
+    d2_blitcopy(s_d2, s_w, s_h, 0, 0, D2_FIX4(s_dw), D2_FIX4(s_dh), D2_FIX4(s_dx), D2_FIX4(s_dy), s_filter ? d2_bf_filter : 0u);
+    {
+        uint64_t t0 = tv_us();
+        d2_executerenderbuffer(s_d2, s_d2_rb, 0u);  /* start only; tv_d2_wait() waits for the end */
+        s_us_kick += tv_us() - t0;
+    }
+    s_d2_busy = 1;
+    d2_selectrenderbuffer(s_d2, s_d2_lvrb);     /* hand D/AVE back to LVGL as it was */
+    d2_setblendmode(s_d2, bsrc, bdst);
+    d2_setalpha(s_d2, alpha);
+}
+#else
+static int  tv_d2_open(int w, int h) { LV_UNUSED(w); LV_UNUSED(h); return -1; }
+static void tv_d2_close(void) {}
+#endif
 
 /* --------------------------------------------------------- callbacks */
 
@@ -317,6 +429,20 @@ static void tv_tick(lv_timer_t * t)
     if (s_have_cur) {
         if ((s_cur.width_Y == s_w) && (s_cur.height_Y == s_h) && (8 == s_cur.bit_depth_Y)) {
             uint64_t t0 = tv_us();
+#if LV_USE_DRAW_DAVE2D
+            if (s_scaled) {
+                uint64_t tw = tv_us();
+                tv_d2_wait();                       /* previous blit done with the source buffer */
+                s_us_wait += tv_us() - tw;
+                t0 = tv_us();
+                tv_yuv_to_rgb565(&s_cur, s_vm, s_w, s_w, s_h, s_full);
+                s_us_cvt += tv_us() - t0;
+                t0 = tv_us();
+                tv_d2_blit(tv_fb_page());
+                s_us_refr += tv_us() - t0;          /* "draw" = D/AVE scaled blit */
+                s_n_refr++;
+            } else
+#endif
             if (s_direct) {
                 uint16_t * dst = tv_fb_dst();
                 s_us_refr += tv_us() - t0;          /* "draw" = finding the page on screen */
@@ -345,6 +471,13 @@ static void tv_tick(lv_timer_t * t)
                s_shown ? (double)s_us_cvt / 1000.0 / s_shown : 0.0,
                s_n_refr ? (double)s_us_refr / 1000.0 / s_n_refr : 0.0,
                (unsigned)(s_us_dec / 50000u), (unsigned)(s_us_cvt / 50000u), (unsigned)(s_us_refr / 50000u));
+#if LV_USE_DRAW_DAVE2D
+        if (s_scaled && s_shown) {
+            printf("video: D/AVE blit: start %.1f ms/frame, wait before next convert %.1f ms/frame\n",
+                   (double)s_us_kick / 1000.0 / s_shown, (double)s_us_wait / 1000.0 / s_shown);
+        }
+        s_us_kick = s_us_wait = 0u;
+#endif
         s_decoded = 0u;
         s_shown = 0u;
         s_us_dec = s_us_cvt = s_us_refr = 0u;
@@ -410,7 +543,8 @@ void thermostat_video_open(void)
     const char * full = getenv("THERMO_VIDEO_FULLRANGE");
     const char * fit  = getenv("THERMO_VIDEO_FIT");
     const char * lvo  = getenv("THERMO_VIDEO_LVGL");
-    const int scale = (NULL != fit) && ('1' == fit[0]);
+    const char * flt  = getenv("THERMO_VIDEO_FILTER");
+    const int scale = !((NULL != fit) && ('0' == fit[0]));    /* full screen unless THERMO_VIDEO_FIT=0 */
     int rate = TV_DEFAULT_FPS;
     size_t bytes;
 
@@ -419,6 +553,7 @@ void thermostat_video_open(void)
     if (NULL != s_layer) { return; }               /* already open */
 
     s_layer = tv_layer();
+    s_filter = !((NULL != flt) && ('0' == flt[0]));
     if (tv_dec_open(&s_d, path) < 0) {
         printf("video: cannot open %s\n", path);
         tv_fail("Video not found", path);
@@ -458,7 +593,8 @@ void thermostat_video_open(void)
     s_dsc.data_size     = (uint32_t)bytes;
     s_dsc.data          = (const uint8_t *)s_px;
 
-    s_direct = !scale && !((NULL != lvo) && ('1' == lvo[0])) && (0 == tv_fb_open(s_w, s_h));
+    s_direct = !((NULL != lvo) && ('1' == lvo[0])) && (0 == tv_fb_open(s_w, s_h));
+    s_scaled = s_direct && scale && (0 == tv_d2_open(s_w, s_h));
     if (s_direct) {
         /* nothing under the overlay may redraw, or LVGL would paint over the picture */
         s_hidden_scr = lv_screen_active();
@@ -479,8 +615,10 @@ void thermostat_video_open(void)
         lv_image_set_scale(s_img, (uint32_t)((sx < sy) ? sx : sy));
     }
 
-    tv_text(s_layer, "Front Door", LV_ALIGN_TOP_LEFT, 16, 12);
-    tv_text(s_layer, "Tap to close", LV_ALIGN_BOTTOM_MID, 0, -12);
+    if (!s_scaled) {                                /* full screen: the picture covers these */
+        tv_text(s_layer, "Front Door", LV_ALIGN_TOP_LEFT, 16, 12);
+        tv_text(s_layer, "Tap to close", LV_ALIGN_BOTTOM_MID, 0, -12);
+    }
 
     s_full      = (NULL != full) && ('1' == full[0]);
     s_frame_ms  = 1000.0 / (double)rate;
@@ -497,7 +635,10 @@ void thermostat_video_open(void)
 #else
            "C convert",
 #endif
-           s_direct ? "frame-buffer" : "LVGL image");
+           s_scaled ? "D/AVE full-screen" : s_direct ? "frame-buffer 1:1" : "LVGL image");
+#if LV_USE_DRAW_DAVE2D
+    if (s_scaled) { printf("video: scaled to %dx%d at %d,%d, filter %s\n", s_dw, s_dh, s_dx, s_dy, s_filter ? "on" : "off"); }
+#endif
     s_us_dec = s_us_cvt = s_us_refr = 0u;
     s_n_refr = 0u;
     lv_display_add_event_cb(lv_display_get_default(), tv_refr_cb, LV_EVENT_ALL, NULL);
@@ -515,6 +656,8 @@ void thermostat_video_close(void)
         lv_display_remove_event_cb_with_user_data(lv_display_get_default(), tv_refr_cb, NULL);
     }
     if (NULL != s_img)   { lv_image_set_src(s_img, NULL); s_img = NULL; }
+    tv_d2_close();
+    s_scaled = 0;
     if (NULL != s_fb)    { munmap(s_fb, s_fb_len); s_fb = NULL; }
     if (s_fb_fd >= 0)    { close(s_fb_fd); s_fb_fd = -1; }
     if ((NULL != s_hidden_scr) && lv_obj_is_valid(s_hidden_scr)) {
